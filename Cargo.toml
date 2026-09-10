@@ -1,6 +1,6 @@
 [package]
 name = "nzb-dispatch"
-version = "0.2.7"
+version = "0.2.8"
 edition = "2024"
 description = "Article-level dispatcher: per-server worker pool, priority gating, retry + hopeless tracking. Part of the nzb-* layered usenet engine."
 license = "MIT"
@@ -8,9 +8,9 @@ repository = "https://github.com/TheDancingDeveloper-org/nzb-dispatch"
 readme = "README.md"
 
 [dependencies]
-nzb-nntp = { version = "0.2.23" }
-nzb-decode = { version = "0.1.3" }
-nzb-core = { version = "0.2.17" }
+nzb-nntp = { version = "0.2.24", path = "../nzb-nntp" }
+nzb-decode = { version = "0.1.4", path = "../nzb-decode" }
+nzb-core = { version = "0.2.18", path = "../nzb-core" }
 
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
@@ -18,14 +18,14 @@ parking_lot = "0.12"
 arc-swap = "1"
 governor = "0.10"
 tracing = "0.1"
-opentelemetry = "0.28"
+opentelemetry.workspace = true
 serde = { version = "1", features = ["derive"] }
 anyhow = "1"
 thiserror = "2"
 unicode-normalization = "0.1"
 
 [dev-dependencies]
-nzb-nntp = { version = "0.2.23", features = ["test-support"] }
+nzb-nntp = { version = "0.2.24", path = "../nzb-nntp", features = ["test-support"] }
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
