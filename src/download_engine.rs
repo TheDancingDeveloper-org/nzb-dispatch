@@ -46,7 +46,7 @@ use nzb_core::models::NzbJob;
 use nzb_decode::FileAssembler;
 use nzb_decode::yenc::decode_yenc;
 use nzb_nntp::Pipeline;
-use nzb_nntp::connection::NntpConnection;
+use nzb_nntp::connection::{ConnectionState, NntpConnection};
 use nzb_nntp::error::NntpError;
 
 use crate::bandwidth::BandwidthLimiter;
@@ -65,6 +65,11 @@ fn increment_counter(name: &'static str) {
 
 /// Max times to retry an article on the SAME server before trying the next.
 const MAX_TRIES_PER_SERVER: u32 = 3;
+/// How many timeouts, dropped connections or unclassified errors one article
+/// absorbs on a server that is otherwise up, before the error counts as that
+/// server's definitive outcome. A server-wide outage (502, 480, 403) is not
+/// counted: the circuit breaker handles those.
+const MAX_OUTAGE_TRIES_PER_SERVER: u32 = 10;
 /// Delay between reconnection attempts.
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 /// Max reconnect attempts before giving up on a server for this session.
@@ -527,6 +532,9 @@ pub(crate) struct WorkItem {
     pub(crate) provider_outcomes: HashMap<String, crate::article_failure::ArticleFailureKind>,
     /// Number of attempts on the current server.
     pub(crate) tries_on_current: u32,
+    /// Timeouts and dropped connections seen for this article while the
+    /// server was otherwise healthy. Reset when the article moves server.
+    pub(crate) outage_tries: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -563,6 +571,11 @@ pub(crate) struct JobContext {
     active_elapsed: Mutex<Duration>,
     /// Total bytes across all files (for perf summary throughput).
     pub total_bytes: u64,
+    /// The first `size=` seen per file. Only a present size is pinned, and it
+    /// is a cross-check rather than an authority: the NZB-declared size is
+    /// the bound, so one article with a wrong or missing `size=` must not
+    /// make every later article of the file fail.
+    pinned_file_sizes: Mutex<HashMap<String, u64>>,
     /// Ensures JobFinished/JobAborted is only emitted once.
     finished: AtomicBool,
     /// Avoid repeatedly reporting the same all-provider outage while the
@@ -603,6 +616,7 @@ impl JobContext {
             active_started: Mutex::new(Some(Instant::now())),
             active_elapsed: Mutex::new(Duration::ZERO),
             total_bytes: job.total_bytes,
+            pinned_file_sizes: Mutex::new(HashMap::new()),
             finished: AtomicBool::new(false),
             waiting_for_providers_reported: AtomicBool::new(false),
         }
@@ -960,6 +974,23 @@ impl SharedWorkQueue {
         }
         q.items = kept;
         drained
+    }
+
+    /// Remove and return every queued item matching `predicate`.
+    /// Remove and return the items matching `predicate`, leaving the rest in
+    /// place and in order.
+    fn take_where(&self, mut predicate: impl FnMut(&WorkItem) -> bool) -> Vec<WorkItem> {
+        let mut q = self.inner.lock();
+        let mut taken = Vec::new();
+        let mut index = 0;
+        while index < q.items.len() {
+            if predicate(&q.items[index]) {
+                taken.push(q.items.remove(index).expect("index < len"));
+            } else {
+                index += 1;
+            }
+        }
+        taken
     }
 
     pub fn len(&self) -> usize {
@@ -1393,7 +1424,10 @@ impl WorkerPool {
             // Reconcile fills any gaps left by reaped workers.
             self.reconcile_servers();
 
-            // ---------- 3. Starvation diagnostic ----------
+            // ---------- 3. Resolve articles no longer waiting on a required server ----------
+            self.resolve_items_not_waiting_on_required_providers();
+
+            // ---------- 4. Starvation diagnostic ----------
             // For each enabled server: if the queue has items but none are
             // workable for this server, log once per minute. "Not workable"
             // can mean either (a) every item has already been tried here, or
@@ -1428,6 +1462,64 @@ impl WorkerPool {
         }
     }
 
+    /// Fail queued articles that every required provider has already
+    /// answered definitively.
+    ///
+    /// An item is normally resolved by the worker that records the last
+    /// outcome. When an optional server becomes unavailable after the other
+    /// servers have answered, the item is left in the queue waiting for that
+    /// server, whose workers no longer pull work. Since the optional server is
+    /// no longer required, resolve such items here.
+    fn resolve_items_not_waiting_on_required_providers(&self) {
+        // Nothing can become resolvable unless an optional server is down:
+        // with every enabled server required, an item resolves only when a
+        // worker records the last server's outcome. Skip the queue walk.
+        {
+            let servers = self.servers.lock();
+            let health = self.server_health.lock();
+            let optional_down = servers.iter().any(|server| {
+                server.enabled
+                    && server.optional
+                    && health.get(&server.id).is_some_and(|h| !h.is_available())
+            });
+            if !optional_down {
+                return;
+            }
+        }
+        let taken = {
+            let servers = self.servers.lock();
+            let health = self.server_health.lock();
+            self.work_queue.take_where(|item| {
+                !item.provider_outcomes.is_empty()
+                    && all_enabled_providers_definitive(&servers, &health, &item.provider_outcomes)
+            })
+        };
+        for item in taken {
+            let ctx = self.job_contexts.lock().get(&item.job_id).cloned();
+            let Some(ctx) = ctx else {
+                continue;
+            };
+            if ctx.cancelled.load(Ordering::Relaxed) {
+                ctx.resolve_one();
+                continue;
+            }
+            let last_server = item.tried_servers.last().cloned().unwrap_or_default();
+            let last_kind = item
+                .provider_outcomes
+                .get(&last_server)
+                .copied()
+                .unwrap_or(crate::article_failure::ArticleFailureKind::NotFound);
+            fail_article_everywhere(
+                &item,
+                &last_server,
+                &ctx,
+                "supervisor",
+                last_kind,
+                "Article unavailable on every required server (optional servers unavailable)",
+            );
+        }
+    }
+
     /// Shut down all workers gracefully. In-flight articles finish first.
     pub async fn shutdown(self: &Arc<Self>) {
         self.shutdown.store(true, Ordering::Relaxed);
@@ -1445,10 +1537,7 @@ impl WorkerPool {
         // Notify workers so any parked on notify.notified() wake up.
         self.work_queue.notify.notify_waiters();
 
-        let timeout = Duration::from_secs(10);
-        for h in handles {
-            let _ = tokio::time::timeout(timeout, h).await;
-        }
+        await_worker_shutdown(handles, Duration::from_secs(10)).await;
 
         if let Some(h) = self.supervisor_handle.lock().take() {
             h.abort();
@@ -1462,6 +1551,31 @@ impl WorkerPool {
     /// Whether this job still has an active context in the pool.
     pub fn has_job(&self, job_id: &str) -> bool {
         self.job_contexts.lock().contains_key(job_id)
+    }
+
+    /// Active (unpaused) download time of a registered job, in seconds.
+    pub fn job_active_secs(&self, job_id: &str) -> Option<f64> {
+        self.job_contexts
+            .lock()
+            .get(job_id)
+            .map(|ctx| ctx.active_elapsed().as_secs_f64())
+    }
+}
+
+async fn await_worker_shutdown(mut handles: Vec<JoinHandle<()>>, timeout: Duration) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    for handle in &mut handles {
+        if tokio::time::timeout_at(deadline, &mut *handle)
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+    for handle in handles {
+        if !handle.is_finished() {
+            handle.abort();
+        }
     }
 }
 
@@ -1771,8 +1885,14 @@ async fn run_worker_serial(
 
         let result = {
             let _activity = conn_slot.activity();
-            let fetch_fut =
-                fetch_article_with_retry(conn, &item, &ctx.assembler, primary_server, worker_id);
+            let fetch_fut = fetch_article_with_retry(
+                conn,
+                &item,
+                &ctx.assembler,
+                &ctx.cancelled,
+                primary_server,
+                worker_id,
+            );
             if let Some(timeout) = pool.stall_timeout {
                 match tokio::time::timeout(timeout, fetch_fut).await {
                     Ok(r) => r,
@@ -1784,7 +1904,17 @@ async fn run_worker_serial(
                             "Connection stalled — no response within {}s, reconnecting",
                             timeout.as_secs()
                         );
-                        pool.work_queue.push_front(item);
+                        if retry_or_fail_over(
+                            item,
+                            primary_server,
+                            pool,
+                            &ctx,
+                            worker_id,
+                            crate::article_failure::ArticleFailureKind::Timeout,
+                            "connection stalled",
+                        ) {
+                            last_progress.store(pool.elapsed_ms(), Ordering::Relaxed);
+                        }
                         return WorkerExit::Reconnect;
                     }
                 }
@@ -1893,6 +2023,14 @@ async fn run_worker_serial(
                 pool.work_queue.push_front(item);
                 return WorkerExit::Reconnect;
             }
+            Err(ArticleError::ServerError { kind, message }) => {
+                if retry_or_fail_over(item, primary_server, pool, &ctx, worker_id, kind, &message) {
+                    last_progress.store(pool.elapsed_ms(), Ordering::Relaxed);
+                }
+                if conn.state != ConnectionState::Ready {
+                    return WorkerExit::Reconnect;
+                }
+            }
             Err(ArticleError::DecodeError(msg)) => {
                 if handle_article_not_available(
                     &mut item,
@@ -1907,6 +2045,11 @@ async fn run_worker_serial(
                 ) {
                     last_progress.store(pool.elapsed_ms(), Ordering::Relaxed);
                 }
+            }
+            Err(ArticleError::Cancelled) => {
+                // Mirror the pipelined path: an aborted job's in-flight
+                // article resolves without being written or reported.
+                ctx.resolve_one();
             }
             Err(ArticleError::AssemblyError(msg)) => {
                 error!(job_id = %item.job_id, file_id = %item.file_id, segment_number = item.segment_number, message_id = %item.message_id, server_id = %primary_server.id, worker_id = %worker_id, original_failure_kind = "decode_error", terminal_failure_kind = "decode_error", "Assembly error: {msg}");
@@ -2132,7 +2275,12 @@ async fn run_worker_pipelined(
                         let yield_t = Instant::now();
                         tokio::task::yield_now().await;
                         perf_yield_us += yield_t.elapsed().as_micros() as u64;
-                        let decode_result = decode_and_assemble(&item, &raw_data, &ctx.assembler);
+                        let decode_result = decode_and_assemble(
+                            &item,
+                            &raw_data,
+                            &ctx.assembler,
+                            Some(&ctx.pinned_file_sizes),
+                        );
                         // Return the buffer to the connection's pool so the
                         // next article's fetch reuses it instead of
                         // allocating fresh.
@@ -2244,7 +2392,13 @@ async fn run_worker_pipelined(
                             Err(_) => {}
                         }
                     }
-                    Err(NntpError::ArticleNotFound(_)) => {
+                    Err(
+                        NntpError::ArticleNotFound(_)
+                        | NntpError::NoSuchGroup(_)
+                        | NntpError::NoArticleSelected(_),
+                    ) => {
+                        // 430 and 411/412/420/423 are article-level "not
+                        // here" answers; the pipelined connection stays usable.
                         if handle_article_not_available(
                             &mut item,
                             primary_server,
@@ -2299,18 +2453,73 @@ async fn run_worker_pipelined(
                             attempt = item.tries_on_current + 1,
                             "Transient pipeline error — re-queuing in-flight work and reconnecting: {e}"
                         );
-                        let is_auth = matches!(
+                        // Only provider-level failures count against the
+                        // circuit breaker, as in the serial path. Article-level
+                        // answers (protocol errors such as 451, timeouts) are
+                        // capped per server by the outage-try limit below;
+                        // counting them let a few bad articles pause the whole
+                        // server.
+                        if counts_against_circuit_breaker(&e) {
+                            let is_auth = matches!(
+                                failure.kind,
+                                crate::article_failure::ArticleFailureKind::AuthFailed
+                                    | crate::article_failure::ArticleFailureKind::PermissionDenied
+                            );
+                            pool.server_health
+                                .lock()
+                                .entry(primary_server.id.clone())
+                                .or_default()
+                                .record_failure(is_auth, &e.to_string());
+                            pool.report_provider_outage();
+                        }
+                        // A server-wide outage (502, 480, 403) says nothing
+                        // about the article, so it is re-queued without
+                        // spending a try: the circuit breaker decides when the
+                        // server is unusable. A timeout or a dropped
+                        // connection on a server that is otherwise serving
+                        // articles may be this one article, so those are
+                        // capped — otherwise one poison article is retried at
+                        // the head of the queue forever.
+                        let server_wide = matches!(
                             failure.kind,
-                            crate::article_failure::ArticleFailureKind::AuthFailed
+                            crate::article_failure::ArticleFailureKind::ServerDown
+                                | crate::article_failure::ArticleFailureKind::AuthFailed
                                 | crate::article_failure::ArticleFailureKind::PermissionDenied
                         );
-                        pool.server_health
-                            .lock()
-                            .entry(primary_server.id.clone())
-                            .or_default()
-                            .record_failure(is_auth, &e.to_string());
-                        pool.report_provider_outage();
-                        pool.work_queue.push_front(item);
+                        let article_outage = matches!(
+                            failure.kind,
+                            crate::article_failure::ArticleFailureKind::Timeout
+                                | crate::article_failure::ArticleFailureKind::ConnectionClosed
+                                | crate::article_failure::ArticleFailureKind::Other
+                        );
+                        if server_wide {
+                            pool.work_queue.push_front(item);
+                        } else if article_outage {
+                            item.outage_tries += 1;
+                            if item.outage_tries < MAX_OUTAGE_TRIES_PER_SERVER {
+                                pool.work_queue.push_front(item);
+                            } else if retry_or_fail_over(
+                                item,
+                                primary_server,
+                                pool,
+                                &ctx,
+                                worker_id,
+                                failure.kind,
+                                &e.to_string(),
+                            ) {
+                                last_progress.store(pool.elapsed_ms(), Ordering::Relaxed);
+                            }
+                        } else if retry_or_fail_over(
+                            item,
+                            primary_server,
+                            pool,
+                            &ctx,
+                            worker_id,
+                            failure.kind,
+                            &e.to_string(),
+                        ) {
+                            last_progress.store(pool.elapsed_ms(), Ordering::Relaxed);
+                        }
                         requeue_all(&mut in_flight_items, &pool.work_queue);
                         return WorkerExit::Reconnect;
                     }
@@ -2467,7 +2676,7 @@ fn handle_article_not_available(
     item: &mut WorkItem,
     primary_server: &ServerConfig,
     all_servers: &Arc<Mutex<Vec<ServerConfig>>>,
-    _server_health: &ServerHealthMap,
+    server_health: &ServerHealthMap,
     ctx: &Arc<JobContext>,
     work_queue: &Arc<SharedWorkQueue>,
     worker_id: &str,
@@ -2480,9 +2689,13 @@ fn handle_article_not_available(
         item.tried_servers.push(primary_server.id.clone());
     }
     item.tries_on_current = 0;
+    item.outage_tries = 0;
 
-    let all_definitive =
-        all_enabled_providers_definitive(&all_servers.lock(), &item.provider_outcomes);
+    let all_definitive = all_enabled_providers_definitive(
+        &all_servers.lock(),
+        &server_health.lock(),
+        &item.provider_outcomes,
+    );
 
     debug!(
         article = %item.message_id,
@@ -2495,57 +2708,7 @@ fn handle_article_not_available(
 
     // (debug log immediately below was added for observability)
     if all_definitive {
-        let mut provider_outcomes = item
-            .provider_outcomes
-            .iter()
-            .map(|(server, outcome)| format!("{server}={}", outcome.as_str()))
-            .collect::<Vec<_>>();
-        provider_outcomes.sort_unstable();
-        let outcomes = provider_outcomes.join(",");
-        let all_not_found = item
-            .provider_outcomes
-            .values()
-            .all(|outcome| *outcome == crate::article_failure::ArticleFailureKind::NotFound);
-        let final_kind = if all_not_found {
-            crate::article_failure::ArticleFailureKind::NotFound
-        } else {
-            crate::article_failure::ArticleFailureKind::DecodeError
-        };
-        warn!(
-            job_id = %item.job_id,
-            file_id = %item.file_id,
-            segment_number = item.segment_number,
-        message_id = %item.message_id,
-        server_id = %primary_server.id,
-        worker_id = %worker_id,
-        original_failure_kind = kind.as_str(),
-        terminal_failure_kind = final_kind.as_str(),
-        attempt = item.tried_servers.len(),
-            provider_outcomes = %outcomes,
-            "{error_msg}"
-        );
-        let final_failure = if final_kind == crate::article_failure::ArticleFailureKind::DecodeError
-        {
-            crate::article_failure::ArticleFailure::decode_error(
-                &primary_server.id,
-                format!("{error_msg}; provider outcomes: {outcomes}"),
-            )
-        } else {
-            increment_counter("articles.explicit_global_absence");
-            crate::article_failure::ArticleFailure::not_found_anywhere(&primary_server.id, outcomes)
-        };
-        try_send_progress(
-            &ctx.progress_tx,
-            &item.job_id,
-            ProgressUpdate::ArticleFailed {
-                job_id: item.job_id.clone(),
-                file_id: item.file_id.clone(),
-                segment_number: item.segment_number,
-                failure: final_failure,
-            },
-        );
-        ctx.articles_failed.fetch_add(1, Ordering::Relaxed);
-        ctx.resolve_one();
+        fail_article_everywhere(item, &primary_server.id, ctx, worker_id, kind, error_msg);
         true
     } else {
         // push_FRONT (not push_back): put the failed item at the front of the
@@ -2560,14 +2723,143 @@ fn handle_article_not_available(
     }
 }
 
+/// Handle a non-connection error for `item` on `primary_server`: retry it on
+/// the same server up to [`MAX_TRIES_PER_SERVER`] times, then record the
+/// error as this server's definitive outcome so the article fails over to
+/// the next server (or fails once every server has an outcome). Without the
+/// cap such errors were re-queued for the same server forever.
+///
+/// Returns `true` when the article was resolved as failed.
+fn retry_or_fail_over(
+    mut item: WorkItem,
+    primary_server: &ServerConfig,
+    pool: &Arc<WorkerPool>,
+    ctx: &Arc<JobContext>,
+    worker_id: &str,
+    kind: crate::article_failure::ArticleFailureKind,
+    message: &str,
+) -> bool {
+    item.tries_on_current += 1;
+    if item.tries_on_current < MAX_TRIES_PER_SERVER {
+        pool.work_queue.push_front(item);
+        return false;
+    }
+    handle_article_not_available(
+        &mut item,
+        primary_server,
+        &pool.servers,
+        &pool.server_health,
+        ctx,
+        &pool.work_queue,
+        worker_id,
+        kind,
+        &format!(
+            "Article failed on every server; last error after {MAX_TRIES_PER_SERVER} attempts: {message}"
+        ),
+    )
+}
+
+/// Resolve an article as failed: every required provider has given a
+/// definitive outcome. `server_id` is the provider that answered last.
+fn fail_article_everywhere(
+    item: &WorkItem,
+    server_id: &str,
+    ctx: &Arc<JobContext>,
+    worker_id: &str,
+    kind: crate::article_failure::ArticleFailureKind,
+    error_msg: &str,
+) {
+    let mut provider_outcomes = item
+        .provider_outcomes
+        .iter()
+        .map(|(server, outcome)| format!("{server}={}", outcome.as_str()))
+        .collect::<Vec<_>>();
+    provider_outcomes.sort_unstable();
+    let outcomes = provider_outcomes.join(",");
+    let all_not_found = item
+        .provider_outcomes
+        .values()
+        .all(|outcome| *outcome == crate::article_failure::ArticleFailureKind::NotFound);
+    let final_kind = if all_not_found {
+        crate::article_failure::ArticleFailureKind::NotFound
+    } else {
+        crate::article_failure::ArticleFailureKind::DecodeError
+    };
+    warn!(
+        job_id = %item.job_id,
+        file_id = %item.file_id,
+        segment_number = item.segment_number,
+        message_id = %item.message_id,
+        server_id = %server_id,
+        worker_id = %worker_id,
+        original_failure_kind = kind.as_str(),
+        terminal_failure_kind = final_kind.as_str(),
+        attempt = item.tried_servers.len(),
+        provider_outcomes = %outcomes,
+        "{error_msg}"
+    );
+    let final_failure = if final_kind == crate::article_failure::ArticleFailureKind::DecodeError {
+        crate::article_failure::ArticleFailure::decode_error(
+            server_id,
+            format!("{error_msg}; provider outcomes: {outcomes}"),
+        )
+    } else {
+        increment_counter("articles.explicit_global_absence");
+        crate::article_failure::ArticleFailure::not_found_anywhere(server_id, outcomes)
+    };
+    try_send_progress(
+        &ctx.progress_tx,
+        &item.job_id,
+        ProgressUpdate::ArticleFailed {
+            job_id: item.job_id.clone(),
+            file_id: item.file_id.clone(),
+            segment_number: item.segment_number,
+            failure: final_failure,
+        },
+    );
+    ctx.articles_failed.fetch_add(1, Ordering::Relaxed);
+    ctx.resolve_one();
+}
+
+/// Whether every provider whose answer is required has given a definitive
+/// outcome for an article.
+///
+/// Every enabled server is required, except an `optional` server that is
+/// currently unavailable (circuit open, e.g. it cannot be reached). A
+/// required server that is down still blocks the decision: an outage is not
+/// evidence that the article is missing. An optional server is a best-effort
+/// extra, so it must not hold articles hostage while it is down.
 fn all_enabled_providers_definitive(
     servers: &[ServerConfig],
+    health: &HashMap<String, ServerHealth>,
     outcomes: &HashMap<String, crate::article_failure::ArticleFailureKind>,
 ) -> bool {
     servers
         .iter()
         .filter(|server| server.enabled)
+        .filter(|server| {
+            !(server.optional && health.get(&server.id).is_some_and(|h| !h.is_available()))
+        })
         .all(|server| outcomes.contains_key(&server.id))
+}
+
+/// Whether a fetch error says the provider itself is unhealthy, and so should
+/// count against its circuit breaker: connection/TLS, auth, permission, 502
+/// and timeouts. A server that accepts the connection and then black-holes
+/// the read is as unhealthy as one that refuses it. Article-level answers
+/// never count.
+fn counts_against_circuit_breaker(e: &NntpError) -> bool {
+    matches!(
+        e,
+        NntpError::Connection(_)
+            | NntpError::Io(_)
+            | NntpError::Tls(_)
+            | NntpError::Auth(_)
+            | NntpError::AuthRequired(_)
+            | NntpError::PermissionDenied(_)
+            | NntpError::ServiceUnavailable(_)
+            | NntpError::Timeout(_)
+    )
 }
 
 /// Re-queue all in-flight items back to the work queue (on connection loss).
@@ -2656,16 +2948,64 @@ pub fn has_known_extension(name: &str) -> bool {
 pub(crate) fn build_job_submission(
     job: &NzbJob,
     progress_tx: mpsc::Sender<ProgressUpdate>,
+    enabled_server_ids: &[String],
 ) -> (Arc<JobContext>, Vec<WorkItem>) {
     let assembler = Arc::new(FileAssembler::new());
     for file in &job.files {
         let output_path = job.work_dir.join(&file.filename);
-        if let Err(e) =
-            assembler.register_file(&job.id, &file.id, output_path, file.articles.len() as u32)
-        {
+        let completed_segments: Vec<u32> = file
+            .articles
+            .iter()
+            .filter(|article| article.downloaded)
+            .map(|article| article.segment_number)
+            .collect();
+        // Register the declared segment numbers rather than assuming 1..=N:
+        // an NZB may skip or repeat numbers.
+        let segment_numbers: Vec<u32> = file
+            .articles
+            .iter()
+            .map(|article| article.segment_number)
+            .collect();
+        // Only trust the NZB size when every segment reported one. The parser
+        // turns a missing or unparsable `bytes` attribute into 0, so a file
+        // whose segments omit it sums to 0 (or to an understatement) and
+        // every article would then be rejected as past the declared size.
+        // With no bound, the write check falls back to the article's size=.
+        let declared_bytes = file
+            .articles
+            .iter()
+            .all(|article| article.bytes > 0)
+            .then_some(file.bytes);
+        if let Err(e) = assembler.register_file_with_segment_numbers(
+            &job.id,
+            &file.id,
+            output_path,
+            &segment_numbers,
+            &completed_segments,
+            declared_bytes,
+        ) {
             error!(file = %file.filename, "Failed to register file for assembly: {e}");
         }
     }
+
+    // `tried_servers` on a persisted article is only ever written when the
+    // article reached a terminal `ArticleFailed`. That is only still terminal
+    // if every server enabled now was one of them: a server added or
+    // re-enabled since the failure has never been asked, so the article must
+    // be fetched again rather than skipped.
+    let is_previously_failed = |article: &nzb_nntp::Article| {
+        !article.downloaded
+            && !enabled_server_ids.is_empty()
+            && enabled_server_ids
+                .iter()
+                .all(|server| article.tried_servers.iter().any(|tried| tried == server))
+    };
+    let previously_failed = job
+        .files
+        .iter()
+        .flat_map(|file| file.articles.iter())
+        .filter(|article| is_previously_failed(article))
+        .count();
 
     let work_items: Vec<WorkItem> = job
         .files
@@ -2673,16 +3013,17 @@ pub(crate) fn build_job_submission(
         .flat_map(|file| {
             file.articles
                 .iter()
-                .filter(|article| !article.downloaded)
+                .filter(|article| !article.downloaded && !is_previously_failed(article))
                 .map(move |article| WorkItem {
                     job_id: job.id.clone(),
                     file_id: file.id.clone(),
                     filename: file.filename.clone(),
                     message_id: article.message_id.clone(),
                     segment_number: article.segment_number,
-                    tried_servers: Vec::new(),
+                    tried_servers: article.tried_servers.clone(),
                     provider_outcomes: HashMap::new(),
                     tries_on_current: 0,
+                    outage_tries: 0,
                 })
         })
         .collect();
@@ -2694,6 +3035,8 @@ pub(crate) fn build_job_submission(
         progress_tx,
         total_remaining,
     ));
+    ctx.articles_failed
+        .store(previously_failed, Ordering::Relaxed);
     (ctx, work_items)
 }
 
@@ -2705,121 +3048,128 @@ async fn fetch_article_with_retry(
     conn: &mut NntpConnection,
     item: &WorkItem,
     assembler: &FileAssembler,
+    cancelled: &AtomicBool,
     _server: &ServerConfig,
     worker_id: &str,
 ) -> Result<ProcessResult, ArticleError> {
-    let mut last_error = None;
-
-    for attempt in 1..=MAX_TRIES_PER_SERVER {
-        let fetch_start = Instant::now();
-        match conn.fetch_article(&item.message_id).await {
-            Ok(response) => {
-                let fetch_us = fetch_start.elapsed().as_micros();
-                let raw_data = response.data.unwrap_or_default();
-                debug!(
-                    worker = %worker_id,
-                    article = %item.message_id,
-                    raw_bytes = raw_data.len(),
-                    fetch_us,
-                    "NNTP fetch complete"
-                );
-                let result = decode_and_assemble(item, &raw_data, assembler);
-                // Return the buffer to the connection's pool so the next
-                // article's fetch reuses it instead of allocating fresh.
+    // Retries of article-level errors are counted per item by the caller
+    // (`WorkItem::tries_on_current`), so each call makes a single attempt.
+    let attempt = item.tries_on_current + 1;
+    let fetch_start = Instant::now();
+    match conn.fetch_article(&item.message_id).await {
+        Ok(response) => {
+            let fetch_us = fetch_start.elapsed().as_micros();
+            let raw_data = response.data.unwrap_or_default();
+            debug!(
+                worker = %worker_id,
+                article = %item.message_id,
+                raw_bytes = raw_data.len(),
+                fetch_us,
+                "NNTP fetch complete"
+            );
+            // The job may have been aborted while this fetch was in
+            // flight. Like the pipelined path, drop the response rather
+            // than writing it into an aborted job's files.
+            if cancelled.load(Ordering::Relaxed) {
                 conn.release_body_buffer(raw_data);
-                return result;
+                return Err(ArticleError::Cancelled);
             }
-            Err(NntpError::ArticleNotFound(_)) => {
-                debug!(
-                    worker = %worker_id,
-                    article = %item.message_id,
-                    "Article not found (430) — will try next server"
-                );
-                return Err(ArticleError::ArticleNotFound);
-            }
-            Err(e @ (NntpError::Connection(_) | NntpError::Io(_))) => {
-                warn!(
-                    worker = %worker_id,
-                    article = %item.message_id,
-                    attempt,
-                    error = %e,
-                    conn_state = ?conn.state,
-                    "Connection/IO error during fetch — connection lost"
-                );
-                return Err(ArticleError::ConnectionLost(format!(
-                    "Connection error on attempt {attempt}: {e}"
-                )));
-            }
-            Err(e @ NntpError::Tls(_)) => {
-                warn!(
-                    worker = %worker_id,
-                    article = %item.message_id,
-                    attempt,
-                    error = %e,
-                    "TLS error during fetch — connection lost"
-                );
-                return Err(ArticleError::ConnectionLost(format!("TLS error: {e}")));
-            }
-            Err(e @ NntpError::ServiceUnavailable(_)) => {
-                warn!(
-                    worker = %worker_id,
-                    article = %item.message_id,
-                    attempt,
-                    error = %e,
-                    "Service unavailable (502) during article fetch — likely rate limited or blocked"
-                );
-                return Err(ArticleError::ProviderUnavailable {
-                    kind: crate::article_failure::ArticleFailureKind::ServerDown,
-                    message: e.to_string(),
-                });
-            }
-            Err(e @ (NntpError::AuthRequired(_) | NntpError::Auth(_))) => {
-                warn!(
-                    worker = %worker_id,
-                    article = %item.message_id,
-                    attempt,
-                    error = %e,
-                    "Auth required (480) during article fetch — session expired or rate limited"
-                );
-                return Err(ArticleError::ProviderUnavailable {
-                    kind: crate::article_failure::ArticleFailureKind::AuthFailed,
-                    message: e.to_string(),
-                });
-            }
-            Err(e @ NntpError::PermissionDenied(_)) => {
-                return Err(ArticleError::ProviderUnavailable {
-                    kind: crate::article_failure::ArticleFailureKind::PermissionDenied,
-                    message: e.to_string(),
-                });
-            }
-            Err(e) => {
-                last_error = Some(format!("{e}"));
-                if attempt < MAX_TRIES_PER_SERVER {
-                    warn!(
-                        worker = %worker_id,
-                        article = %item.message_id,
-                        attempt,
-                        max_tries = MAX_TRIES_PER_SERVER,
-                        error = %e,
-                        "Transient fetch error, retrying in 500ms"
-                    );
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                } else {
-                    warn!(
-                        worker = %worker_id,
-                        article = %item.message_id,
-                        attempt,
-                        error = %e,
-                        "All retries on this server exhausted"
-                    );
-                }
-            }
+            let result = decode_and_assemble(item, &raw_data, assembler, None);
+            // Return the buffer to the connection's pool so the next
+            // article's fetch reuses it instead of allocating fresh.
+            conn.release_body_buffer(raw_data);
+            result
+        }
+        Err(NntpError::ArticleNotFound(_)) => {
+            debug!(
+                worker = %worker_id,
+                article = %item.message_id,
+                "Article not found (430) — will try next server"
+            );
+            Err(ArticleError::ArticleNotFound)
+        }
+        Err(e @ (NntpError::NoSuchGroup(_) | NntpError::NoArticleSelected(_))) => {
+            // 411/412/420/423: an article-level "not here" answer. Retrying on
+            // this server cannot change it.
+            debug!(
+                worker = %worker_id,
+                article = %item.message_id,
+                error = %e,
+                "Article unavailable on this server — will try next server"
+            );
+            Err(ArticleError::ArticleNotFound)
+        }
+        Err(e @ (NntpError::Connection(_) | NntpError::Io(_))) => {
+            warn!(
+                worker = %worker_id,
+                article = %item.message_id,
+                attempt,
+                error = %e,
+                conn_state = ?conn.state,
+                "Connection/IO error during fetch — connection lost"
+            );
+            Err(ArticleError::ConnectionLost(format!(
+                "Connection error on attempt {attempt}: {e}"
+            )))
+        }
+        Err(e @ NntpError::Tls(_)) => {
+            warn!(
+                worker = %worker_id,
+                article = %item.message_id,
+                attempt,
+                error = %e,
+                "TLS error during fetch — connection lost"
+            );
+            Err(ArticleError::ConnectionLost(format!("TLS error: {e}")))
+        }
+        Err(e @ NntpError::ServiceUnavailable(_)) => {
+            warn!(
+                worker = %worker_id,
+                article = %item.message_id,
+                attempt,
+                error = %e,
+                "Service unavailable (502) during article fetch — likely rate limited or blocked"
+            );
+            Err(ArticleError::ProviderUnavailable {
+                kind: crate::article_failure::ArticleFailureKind::ServerDown,
+                message: e.to_string(),
+            })
+        }
+        Err(e @ (NntpError::AuthRequired(_) | NntpError::Auth(_))) => {
+            warn!(
+                worker = %worker_id,
+                article = %item.message_id,
+                attempt,
+                error = %e,
+                "Auth required (480) during article fetch — session expired or rate limited"
+            );
+            Err(ArticleError::ProviderUnavailable {
+                kind: crate::article_failure::ArticleFailureKind::AuthFailed,
+                message: e.to_string(),
+            })
+        }
+        Err(e @ NntpError::PermissionDenied(_)) => Err(ArticleError::ProviderUnavailable {
+            kind: crate::article_failure::ArticleFailureKind::PermissionDenied,
+            message: e.to_string(),
+        }),
+        Err(e) => {
+            // Protocol / unexpected response / timeout and the like. The caller
+            // retries up to MAX_TRIES_PER_SERVER times on this server, then
+            // records a definitive outcome so the article fails over.
+            warn!(
+                worker = %worker_id,
+                article = %item.message_id,
+                attempt,
+                max_tries = MAX_TRIES_PER_SERVER,
+                error = %e,
+                "Article fetch error on this server"
+            );
+            Err(ArticleError::ServerError {
+                kind: crate::article_failure::ArticleFailure::from_nntp(&e, "").kind,
+                message: e.to_string(),
+            })
         }
     }
-
-    Err(ArticleError::ConnectionLost(
-        last_error.unwrap_or_else(|| "Unknown error after retries".into()),
-    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -2841,6 +3191,14 @@ enum ArticleError {
     ArticleNotFound,
     #[error("Connection lost: {0}")]
     ConnectionLost(String),
+    /// A non-connection error for this article on this server (protocol
+    /// error, unexpected response, timeout). Retried a bounded number of
+    /// times per server, then treated as a definitive outcome.
+    #[error("Server error ({kind:?}): {message}")]
+    ServerError {
+        kind: crate::article_failure::ArticleFailureKind,
+        message: String,
+    },
     #[error("Provider unavailable ({kind:?}): {message}")]
     ProviderUnavailable {
         kind: crate::article_failure::ArticleFailureKind,
@@ -2850,12 +3208,92 @@ enum ArticleError {
     DecodeError(String),
     #[error("Assembly error: {0}")]
     AssemblyError(String),
+    /// The job was cancelled while the fetch was in flight; the article was
+    /// not written.
+    #[error("Job cancelled")]
+    Cancelled,
+}
+
+/// Choose the file offset a decoded article is written at, rejecting headers
+/// that would place it outside the file.
+///
+/// The offset comes from `=ypart begin=` and is used directly as the `pwrite`
+/// position. The bound is the size the NZB declared for the file
+/// (`declared_bytes`), not the `size=` the article itself claims: a forged
+/// `size=2e12 begin=1e12` would otherwise create a terabyte sparse file. The
+/// first `size=` seen for a file is pinned (`pinned_size`) and later articles
+/// must agree with it. A multi-segment file with no bound at all — no NZB
+/// size and no `size=` — is rejected, as is a `part_end` that does not
+/// describe exactly the decoded bytes. A missing `=ypart` on a later segment
+/// would overwrite the start of the file and is rejected too.
+fn validated_write_offset(
+    segment_number: u32,
+    decoded: &nzb_decode::YencDecodeResult,
+    data_len: u64,
+    declared_bytes: Option<u64>,
+    pinned_size: Option<u64>,
+) -> Result<u64, String> {
+    let file_size = decoded.file_size;
+    let part_begin = decoded.part_begin;
+    let part_end = decoded.part_end;
+    if file_size != pinned_size {
+        return Err(format!(
+            "article size {file_size:?} does not match the size {pinned_size:?} established for this file"
+        ));
+    }
+    let bound = match declared_bytes.or(pinned_size) {
+        Some(size) => Some(size),
+        None if segment_number <= 1 => None,
+        None => {
+            return Err(format!(
+                "no declared file size for multi-segment file (segment {segment_number})"
+            ));
+        }
+    };
+    let begin = match part_begin {
+        Some(begin) => begin,
+        // A single-part article (no =ypart) can only be the first segment.
+        None if segment_number <= 1 => 0,
+        None => {
+            return Err(format!(
+                "no =ypart header on segment {segment_number} of a multi-part file"
+            ));
+        }
+    };
+    if let Some(size) = bound {
+        if size == 0 {
+            return Err("declared file size is 0".to_string());
+        }
+        if begin >= size {
+            return Err(format!(
+                "=ypart begin {begin} is past the declared file size {size}"
+            ));
+        }
+        match begin.checked_add(data_len) {
+            Some(end) if end <= size => {
+                if let Some(part_end) = part_end
+                    && part_end != end
+                {
+                    return Err(format!(
+                        "=ypart end {part_end} does not match the decoded bytes ending at {end}"
+                    ));
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "part range begin={begin} len={data_len} exceeds declared file size {size}"
+                ));
+            }
+        }
+    }
+    Ok(begin)
 }
 
 fn decode_and_assemble(
     item: &WorkItem,
     raw_data: &[u8],
     assembler: &FileAssembler,
+    pinned_file_sizes: Option<&Mutex<HashMap<String, u64>>>,
 ) -> Result<ProcessResult, ArticleError> {
     let decode_start = Instant::now();
     let decoded = decode_yenc(raw_data).map_err(|e| {
@@ -2866,9 +3304,54 @@ fn decode_and_assemble(
     })?;
     let decode_us = decode_start.elapsed().as_micros();
 
-    let yenc_filename = decoded.filename;
-    let data_begin = decoded.part_begin.unwrap_or(0);
+    // Remember the first size= seen for this file, but only a real one: an
+    // article that omits size= must not become the pin. The pin is a
+    // cross-check. The NZB-declared size is what bounds the write, so when it
+    // is known a disagreement is logged and the article is still written.
+    let declared = assembler.declared_bytes(&item.job_id, &item.file_id);
+    let pinned_size = match (pinned_file_sizes, decoded.file_size) {
+        (Some(sizes), Some(size)) => {
+            let mut sizes = sizes.lock();
+            match sizes.entry(item.file_id.clone()) {
+                std::collections::hash_map::Entry::Occupied(existing) => Some(*existing.get()),
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(size);
+                    Some(size)
+                }
+            }
+        }
+        (Some(sizes), None) => sizes.lock().get(&item.file_id).copied(),
+        (None, size) => size,
+    };
+    if declared.is_some() && decoded.file_size != pinned_size {
+        warn!(
+            file_id = %item.file_id,
+            segment_number = item.segment_number,
+            article_size = ?decoded.file_size,
+            pinned_size = ?pinned_size,
+            "yEnc size= disagrees with the size pinned for this file; the NZB-declared size is the bound"
+        );
+    }
+
     let decoded_len = decoded.data.len() as u64;
+    let data_begin = validated_write_offset(
+        item.segment_number,
+        &decoded,
+        decoded_len,
+        declared,
+        if declared.is_some() {
+            decoded.file_size
+        } else {
+            pinned_size
+        },
+    )
+    .map_err(|reason| {
+        ArticleError::DecodeError(format!(
+            "Corrupt yEnc article for {} seg {}: {reason}",
+            item.filename, item.segment_number
+        ))
+    })?;
+    let yenc_filename = decoded.filename;
 
     let assemble_start = Instant::now();
     let file_complete = assembler
@@ -2923,6 +3406,20 @@ mod tests {
         )
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn worker_shutdown_uses_one_shared_deadline() {
+        let handles = (0..3)
+            .map(|_| tokio::spawn(std::future::pending()))
+            .collect();
+        let shutdown = tokio::spawn(await_worker_shutdown(handles, Duration::from_secs(10)));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(9)).await;
+        tokio::task::yield_now().await;
+        assert!(!shutdown.is_finished());
+        tokio::time::advance(Duration::from_secs(2)).await;
+        shutdown.await.unwrap();
+    }
+
     fn test_job(job_id: &str, root: &std::path::Path) -> NzbJob {
         NzbJob {
             id: job_id.to_string(),
@@ -2944,6 +3441,8 @@ mod tests {
             password: None,
             error_message: None,
             speed_bps: 0,
+            pp_override: None,
+            delete_archives: None,
             server_stats: Vec::new(),
             files: Vec::new(),
         }
@@ -2985,7 +3484,7 @@ mod tests {
         });
         let (tx, _rx) = mpsc::channel(4);
 
-        let (_ctx, items) = build_job_submission(&job, tx);
+        let (_ctx, items) = build_job_submission(&job, tx, &["srv1".into()]);
 
         assert_eq!(
             items
@@ -2994,6 +3493,361 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("third", 3), ("first", 1)]
         );
+    }
+
+    #[test]
+    fn file_without_segment_bytes_still_assembles() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut job = test_job("no-bytes", temp.path());
+        let article = |message_id: &str, segment_number: u32| nzb_nntp::Article {
+            message_id: message_id.to_string(),
+            segment_number,
+            bytes: 0,
+            downloaded: false,
+            data_begin: None,
+            data_size: None,
+            crc32: None,
+            tried_servers: Vec::new(),
+            tries: 0,
+        };
+        job.files.push(nzb_core::models::NzbFile {
+            id: "file-1".into(),
+            filename: "out.bin".into(),
+            bytes: 0,
+            bytes_downloaded: 0,
+            is_par2: false,
+            par2_setname: None,
+            par2_vol: None,
+            par2_blocks: None,
+            assembled: false,
+            groups: Vec::new(),
+            articles: vec![article("seg1", 1), article("seg2", 2)],
+        });
+        let (tx, _rx) = mpsc::channel(4);
+        let (ctx, _items) = build_job_submission(&job, tx, &["srv1".into()]);
+        // A missing bytes= attribute parses as 0, so there is no NZB bound.
+        assert_eq!(ctx.assembler.declared_bytes(&job.id, "file-1"), None);
+
+        let (seg1, _) = yenc_simd::encode_article(b"AAAA", "out.bin", 1, 2, 0, 8);
+        let (seg2, _) = yenc_simd::encode_article(b"BBBB", "out.bin", 2, 2, 4, 8);
+        let item = |segment_number| {
+            let mut item = make_item(&job.id, "msg@test", "out.bin");
+            item.file_id = "file-1".into();
+            item.segment_number = segment_number;
+            item
+        };
+        decode_and_assemble(&item(1), &seg1, &ctx.assembler, None).unwrap();
+        let second = decode_and_assemble(&item(2), &seg2, &ctx.assembler, None).unwrap();
+
+        assert!(second.file_complete);
+        assert_eq!(
+            std::fs::read(temp.path().join("out.bin")).unwrap(),
+            b"AAAABBBB"
+        );
+    }
+
+    #[test]
+    fn submission_with_segment_gap_completes_when_all_declared_segments_written() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut job = test_job("segment-gap", temp.path());
+        let article = |message_id: &str, segment_number: u32| nzb_nntp::Article {
+            message_id: message_id.to_string(),
+            segment_number,
+            bytes: 4,
+            downloaded: false,
+            data_begin: None,
+            data_size: None,
+            crc32: None,
+            tried_servers: Vec::new(),
+            tries: 0,
+        };
+        job.files.push(nzb_core::models::NzbFile {
+            id: "file-1".into(),
+            filename: "gap.bin".into(),
+            bytes: 16,
+            bytes_downloaded: 0,
+            is_par2: false,
+            par2_setname: None,
+            par2_vol: None,
+            par2_blocks: None,
+            assembled: false,
+            groups: Vec::new(),
+            // Segment 3 is absent from the NZB.
+            articles: vec![article("s1", 1), article("s2", 2), article("s4", 4)],
+        });
+        let (tx, _rx) = mpsc::channel(4);
+        let (ctx, _items) = build_job_submission(&job, tx, &["srv1".into()]);
+
+        let asm = &ctx.assembler;
+        assert!(
+            !asm.assemble_article(&job.id, "file-1", 1, 0, b"AAAA")
+                .unwrap()
+        );
+        assert!(
+            !asm.assemble_article(&job.id, "file-1", 2, 4, b"BBBB")
+                .unwrap()
+        );
+        // Segment 4 must be accepted and must complete the file.
+        assert!(
+            asm.assemble_article(&job.id, "file-1", 4, 12, b"DDDD")
+                .unwrap()
+        );
+        assert!(asm.is_file_complete(&job.id, "file-1"));
+        assert_eq!(asm.get_file_progress(&job.id, "file-1"), (3, 3));
+    }
+
+    #[test]
+    fn submission_does_not_requeue_previously_failed_articles() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut job = test_job("previously-failed", temp.path());
+        let article = |message_id: &str, segment_number: u32, tried: &[&str]| nzb_nntp::Article {
+            message_id: message_id.to_string(),
+            segment_number,
+            bytes: 100,
+            downloaded: false,
+            data_begin: None,
+            data_size: None,
+            crc32: None,
+            tried_servers: tried.iter().map(|s| s.to_string()).collect(),
+            tries: tried.len() as u32,
+        };
+        job.files.push(nzb_core::models::NzbFile {
+            id: "file-1".into(),
+            filename: "partial.bin".into(),
+            bytes: 200,
+            bytes_downloaded: 0,
+            is_par2: false,
+            par2_setname: None,
+            par2_vol: None,
+            par2_blocks: None,
+            assembled: false,
+            groups: Vec::new(),
+            articles: vec![article("pending", 1, &[]), article("failed", 2, &["srv1"])],
+        });
+        let (tx, _rx) = mpsc::channel(4);
+
+        let (ctx, items) = build_job_submission(&job, tx, &["srv1".into()]);
+
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.message_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pending"]
+        );
+        assert_eq!(ctx.articles_remaining.load(Ordering::Relaxed), 1);
+        assert_eq!(ctx.articles_failed.load(Ordering::Relaxed), 1);
+
+        // A server enabled since the failure has never been asked, so the
+        // article is fetched again instead of being skipped.
+        let (tx, _rx) = mpsc::channel(4);
+        let (ctx, items) = build_job_submission(&job, tx, &["srv1".into(), "srv2".into()]);
+        assert_eq!(items.len(), 2);
+        assert_eq!(ctx.articles_failed.load(Ordering::Relaxed), 0);
+    }
+
+    fn decode_test_item(job_id: &str, segment_number: u32) -> WorkItem {
+        let mut item = make_item(job_id, "msg@test", "out.bin");
+        item.segment_number = segment_number;
+        item
+    }
+
+    #[test]
+    fn decode_rejects_ypart_offset_beyond_declared_file_size() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("out.bin");
+        let assembler = FileAssembler::new();
+        assembler
+            .register_file("j1", "f1", path.clone(), 2)
+            .unwrap();
+
+        // Part 2 of an 8-byte file claims to start at ~1 TB.
+        let (raw, _) = yenc_simd::encode_article(b"BBBB", "out.bin", 2, 2, 1_000_000_000_000, 8);
+        let result = decode_and_assemble(&decode_test_item("j1", 2), &raw, &assembler, None);
+
+        assert!(
+            matches!(result, Err(ArticleError::DecodeError(_))),
+            "expected corrupt-article error, got {result:?}"
+        );
+        assert!(std::fs::metadata(&path).unwrap().len() <= 8);
+        assert_eq!(assembler.get_file_progress("j1", "f1"), (0, 2));
+    }
+
+    #[test]
+    fn decode_rejects_forged_size_past_nzb_declared_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("out.bin");
+        let assembler = FileAssembler::new();
+        // The NZB says the file is 8 bytes. The article claims 2 TB and asks
+        // to be written at 1 TB, which the article's own size= would allow.
+        assembler
+            .register_file_with_segment_numbers("j1", "f1", path.clone(), &[1, 2], &[], Some(8))
+            .unwrap();
+
+        let (raw, _) = yenc_simd::encode_article(
+            b"BBBB",
+            "out.bin",
+            2,
+            2,
+            1_000_000_000_000,
+            2_000_000_000_000,
+        );
+        let result = decode_and_assemble(&decode_test_item("j1", 2), &raw, &assembler, None);
+
+        assert!(
+            matches!(result, Err(ArticleError::DecodeError(_))),
+            "forged size= must not win over the NZB size, got {result:?}"
+        );
+        assert!(std::fs::metadata(&path).unwrap().len() <= 8);
+        assert_eq!(assembler.get_file_progress("j1", "f1"), (0, 2));
+    }
+
+    #[test]
+    fn decode_rejects_missing_size_on_multi_segment_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("out.bin");
+        let assembler = FileAssembler::new();
+        // No NZB size, and the article carries no size= either.
+        assembler
+            .register_file("j1", "f1", path.clone(), 2)
+            .unwrap();
+
+        let (mut raw, _) = yenc_simd::encode_article(b"BBBB", "out.bin", 2, 2, 4, 8);
+        let header_end = raw.windows(2).position(|w| w == b"\r\n").unwrap();
+        raw.splice(
+            0..header_end,
+            b"=ybegin part=2 line=128 name=out.bin".iter().copied(),
+        );
+        let result = decode_and_assemble(&decode_test_item("j1", 2), &raw, &assembler, None);
+
+        assert!(
+            matches!(result, Err(ArticleError::DecodeError(_))),
+            "a multi-segment file with no bound at all must be rejected, got {result:?}"
+        );
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        assert_eq!(assembler.get_file_progress("j1", "f1"), (0, 2));
+    }
+
+    #[test]
+    fn decode_rejects_ypart_range_overrunning_declared_file_size() {
+        let temp = tempfile::tempdir().unwrap();
+        let assembler = FileAssembler::new();
+        assembler
+            .register_file("j1", "f1", temp.path().join("out.bin"), 2)
+            .unwrap();
+
+        // Begins inside the file but runs 2 bytes past its declared end.
+        let (raw, _) = yenc_simd::encode_article(b"BBBB", "out.bin", 2, 2, 6, 8);
+        let result = decode_and_assemble(&decode_test_item("j1", 2), &raw, &assembler, None);
+
+        assert!(matches!(result, Err(ArticleError::DecodeError(_))));
+        assert_eq!(assembler.get_file_progress("j1", "f1"), (0, 2));
+    }
+
+    #[test]
+    fn decode_rejects_missing_ypart_on_non_first_segment() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("out.bin");
+        let assembler = FileAssembler::new();
+        assembler
+            .register_file("j1", "f1", path.clone(), 2)
+            .unwrap();
+
+        let (seg1, _) = yenc_simd::encode_article(b"AAAA", "out.bin", 1, 2, 0, 8);
+        decode_and_assemble(&decode_test_item("j1", 1), &seg1, &assembler, None).unwrap();
+
+        // Segment 2 arrives as a single-part article (no =ypart). Writing it
+        // at offset 0 would overwrite segment 1.
+        let (seg2, _) = yenc_simd::encode_article(b"ZZZZ", "out.bin", 1, 1, 0, 4);
+        let result = decode_and_assemble(&decode_test_item("j1", 2), &seg2, &assembler, None);
+
+        assert!(matches!(result, Err(ArticleError::DecodeError(_))));
+        assert_eq!(std::fs::read(&path).unwrap(), b"AAAA");
+        assert_eq!(assembler.get_file_progress("j1", "f1"), (1, 2));
+    }
+
+    #[test]
+    fn decode_accepts_valid_parts_and_single_part_articles() {
+        let temp = tempfile::tempdir().unwrap();
+        let multi = temp.path().join("multi.bin");
+        let single = temp.path().join("single.bin");
+        let assembler = FileAssembler::new();
+        assembler
+            .register_file("j1", "f1", multi.clone(), 2)
+            .unwrap();
+        assembler
+            .register_file("j1", "f2", single.clone(), 1)
+            .unwrap();
+
+        let (seg2, _) = yenc_simd::encode_article(b"BBBB", "multi.bin", 2, 2, 4, 8);
+        let (seg1, _) = yenc_simd::encode_article(b"AAAA", "multi.bin", 1, 2, 0, 8);
+        assert!(
+            !decode_and_assemble(&decode_test_item("j1", 2), &seg2, &assembler, None)
+                .unwrap()
+                .file_complete
+        );
+        assert!(
+            decode_and_assemble(&decode_test_item("j1", 1), &seg1, &assembler, None)
+                .unwrap()
+                .file_complete
+        );
+        assert_eq!(std::fs::read(&multi).unwrap(), b"AAAABBBB");
+
+        let (whole, _) = yenc_simd::encode_article(b"ONE", "single.bin", 1, 1, 0, 3);
+        let mut item = decode_test_item("j1", 1);
+        item.file_id = "f2".into();
+        assert!(
+            decode_and_assemble(&item, &whole, &assembler, None)
+                .unwrap()
+                .file_complete
+        );
+        assert_eq!(std::fs::read(&single).unwrap(), b"ONE");
+    }
+
+    #[tokio::test]
+    async fn serial_fetch_does_not_write_article_after_job_cancelled() {
+        use nzb_nntp::testutil::{MockConfig, MockNntpServer, test_config};
+
+        let (encoded, _) = yenc_simd::encode_article(b"payload", "out.bin", 1, 1, 0, 7);
+        let mut articles = HashMap::new();
+        articles.insert("msg@test".to_string(), encoded);
+        let server = MockNntpServer::start(MockConfig {
+            articles,
+            ..MockConfig::default()
+        })
+        .await;
+        let config = test_config(server.port());
+        let mut conn = NntpConnection::new(config.id.clone());
+        conn.connect(&config).await.unwrap();
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("out.bin");
+        let assembler = FileAssembler::new();
+        assembler
+            .register_file("j1", "f1", path.clone(), 1)
+            .unwrap();
+        let item = make_item("j1", "msg@test", "out.bin");
+
+        // abort_job() flips the flag while the fetch is in flight.
+        let cancelled = AtomicBool::new(true);
+        let result =
+            fetch_article_with_retry(&mut conn, &item, &assembler, &cancelled, &config, "w0").await;
+
+        assert!(
+            matches!(result, Err(ArticleError::Cancelled)),
+            "expected Cancelled, got {result:?}"
+        );
+        assert_eq!(assembler.get_file_progress("j1", "f1"), (0, 1));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+
+        // Sanity: the same fetch succeeds and writes when not cancelled.
+        let not_cancelled = AtomicBool::new(false);
+        let result =
+            fetch_article_with_retry(&mut conn, &item, &assembler, &not_cancelled, &config, "w0")
+                .await
+                .unwrap();
+        assert!(result.file_complete);
+        assert_eq!(std::fs::read(&path).unwrap(), b"payload");
     }
 
     #[cfg(target_os = "linux")]
@@ -3071,6 +3925,7 @@ mod tests {
             tried_servers: Vec::new(),
             provider_outcomes: HashMap::new(),
             tries_on_current: 0,
+            outage_tries: 0,
         }
     }
 
@@ -3187,12 +4042,96 @@ mod tests {
             crate::article_failure::ArticleFailureKind::NotFound,
         );
 
-        assert!(!all_enabled_providers_definitive(&servers, &outcomes));
+        let health = HashMap::new();
+        assert!(!all_enabled_providers_definitive(
+            &servers, &health, &outcomes
+        ));
         outcomes.insert(
             "srv2".to_string(),
             crate::article_failure::ArticleFailureKind::NotFound,
         );
-        assert!(all_enabled_providers_definitive(&servers, &outcomes));
+        assert!(all_enabled_providers_definitive(
+            &servers, &health, &outcomes
+        ));
+    }
+
+    #[test]
+    fn unavailable_optional_provider_is_not_required() {
+        let mut optional = ServerConfig::new("fill", "fill.invalid");
+        optional.optional = true;
+        let servers = vec![ServerConfig::new("main", "main.invalid"), optional];
+        let mut outcomes = HashMap::new();
+        outcomes.insert(
+            "main".to_string(),
+            crate::article_failure::ArticleFailureKind::NotFound,
+        );
+        let mut health = HashMap::new();
+
+        // A healthy optional server is still asked.
+        assert!(!all_enabled_providers_definitive(
+            &servers, &health, &outcomes
+        ));
+
+        let mut down = ServerHealth::new();
+        down.record_failure(true, "502 on connect");
+        health.insert("fill".to_string(), down);
+        assert!(all_enabled_providers_definitive(
+            &servers, &health, &outcomes
+        ));
+
+        // A required server that is down still blocks the decision.
+        let mut main_down = ServerHealth::new();
+        main_down.record_failure(true, "502 on connect");
+        health.insert("main".to_string(), main_down);
+        outcomes.clear();
+        assert!(!all_enabled_providers_definitive(
+            &servers, &health, &outcomes
+        ));
+    }
+
+    #[tokio::test]
+    async fn supervisor_sweep_fails_items_left_waiting_on_down_optional_server() {
+        let temp = tempfile::tempdir().unwrap();
+        let pool = worker_pool_without_servers();
+        let mut optional = ServerConfig::new("fill", "fill.invalid");
+        optional.optional = true;
+        *pool.servers.lock() = vec![ServerConfig::new("main", "main.invalid"), optional];
+
+        let job = test_job("sweep", temp.path());
+        let (progress_tx, mut progress_rx) = mpsc::channel(8);
+        let ctx = Arc::new(JobContext::new(
+            &job,
+            Arc::new(FileAssembler::new()),
+            progress_tx,
+            1,
+        ));
+        pool.job_contexts.lock().insert(job.id.clone(), ctx.clone());
+        let mut item = make_item("sweep", "missing@test", "payload.bin");
+        item.tried_servers.push("main".into());
+        item.provider_outcomes.insert(
+            "main".into(),
+            crate::article_failure::ArticleFailureKind::NotFound,
+        );
+        pool.work_queue.push_front(item);
+
+        // Optional server still healthy: the item keeps waiting for it.
+        pool.resolve_items_not_waiting_on_required_providers();
+        assert_eq!(pool.work_queue.len(), 1);
+
+        // It goes down after the main server answered.
+        let mut down = ServerHealth::new();
+        down.record_failure(true, "502 on connect");
+        pool.server_health.lock().insert("fill".into(), down);
+        pool.resolve_items_not_waiting_on_required_providers();
+
+        assert_eq!(pool.work_queue.len(), 0);
+        assert_eq!(ctx.articles_failed.load(Ordering::Relaxed), 1);
+        assert_eq!(ctx.articles_remaining.load(Ordering::Relaxed), 0);
+        let mut saw_failure = false;
+        while let Ok(update) = progress_rx.try_recv() {
+            saw_failure |= matches!(update, ProgressUpdate::ArticleFailed { .. });
+        }
+        assert!(saw_failure);
     }
 
     #[tokio::test]
@@ -3333,6 +4272,24 @@ mod tests {
 
         assert!(!pool.has_job(job_id));
         assert_eq!(assembler.get_file_progress(job_id, "file-1"), (0, 0));
+    }
+
+    #[test]
+    fn job_active_secs_reports_registered_jobs_only() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let job = test_job("active-secs", tempdir.path());
+        let pool = worker_pool_without_servers();
+        assert_eq!(pool.job_active_secs(&job.id), None);
+
+        insert_test_context(&pool, &job, Arc::new(FileAssembler::new()));
+        pool.pause_job(&job.id);
+        let paused = pool.job_active_secs(&job.id).expect("registered job");
+        assert!(paused >= 0.0);
+        // A paused job's clock is stopped.
+        assert_eq!(pool.job_active_secs(&job.id), Some(paused));
+
+        pool.release_completed_job(&job.id);
+        assert_eq!(pool.job_active_secs(&job.id), None);
     }
 
     #[cfg(target_os = "linux")]
@@ -3513,5 +4470,29 @@ mod tests {
 
         assert_eq!(t.connected_snapshot(), vec![("srv1".into(), 0, 1)]);
         assert_eq!(t.snapshot(), vec![("srv1".into(), 1, 1)]);
+    }
+
+    #[test]
+    fn only_provider_level_errors_count_against_circuit_breaker() {
+        let s = || "x".to_string();
+        for e in [
+            NntpError::Connection(s()),
+            NntpError::Tls(s()),
+            NntpError::Auth(s()),
+            NntpError::AuthRequired(s()),
+            NntpError::PermissionDenied(s()),
+            NntpError::ServiceUnavailable(s()),
+            NntpError::Timeout(s()),
+        ] {
+            assert!(counts_against_circuit_breaker(&e), "{e}");
+        }
+        for e in [
+            NntpError::ArticleNotFound(s()),
+            NntpError::NoSuchGroup(s()),
+            NntpError::NoArticleSelected(s()),
+            NntpError::Protocol(s()),
+        ] {
+            assert!(!counts_against_circuit_breaker(&e), "{e}");
+        }
     }
 }
