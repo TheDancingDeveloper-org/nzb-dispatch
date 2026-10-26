@@ -20,6 +20,7 @@ use crate::bandwidth::BandwidthLimiter;
 use crate::download_engine::{ConnectionTracker, ProgressUpdate, WorkerPool, build_job_submission};
 use nzb_core::config::ServerConfig;
 use nzb_core::models::NzbJob;
+use nzb_nntp::budget::BudgetRegistry;
 use parking_lot::Mutex;
 
 /// Article-dispatch engine: accepts jobs, drives NNTP fetches, emits progress.
@@ -70,6 +71,13 @@ pub trait DispatchEngine: Send + Sync {
         None
     }
 
+    /// NZB file ids of `job_id`'s PAR2 recovery volumes held back by
+    /// `par2.defer_volumes` and not yet released, or `None` when the job is
+    /// not registered. Queue sizes leave these out, as SABnzbd does.
+    fn held_par2_files(&self, _job_id: &str) -> Option<Vec<String>> {
+        None
+    }
+
     /// Release a terminal job's dispatcher and assembler resources before
     /// post-processing opens the completed files.
     fn release_completed_job(&self, job_id: &str);
@@ -77,7 +85,8 @@ pub trait DispatchEngine: Send + Sync {
     /// Replace server configuration and reconcile connection budgets/workers.
     fn update_servers(&self, servers: Vec<ServerConfig>);
 
-    /// Per-server allocated worker slots and configured limits.
+    /// Per-server NNTP sockets actually open (busy or idle) and configured
+    /// limits. Worker slots whose socket the provider closed are not counted.
     fn connection_snapshot(&self) -> Vec<(String, usize, usize)>;
 
     /// Per-server connections actively transferring articles and limits.
@@ -93,6 +102,18 @@ pub trait DispatchEngine: Send + Sync {
     /// Override the idle-worker eviction threshold. Tests shrink this to
     /// make the watchdog converge in seconds; production uses the default.
     fn set_max_worker_idle(&self, d: Duration);
+
+    /// Override how often idle workers probe their socket for a
+    /// provider-side close. Tests shrink this; production uses the default.
+    fn set_idle_keepalive(&self, _d: Duration) {}
+
+    /// Override how long an idle worker keeps its socket and its share of
+    /// the server's connection budget. Tests shrink this.
+    fn set_idle_release(&self, _d: Duration) {}
+
+    /// `par2.defer_volumes`: hold PAR2 recovery volumes until the job's slice
+    /// map shows damage. Applies to jobs submitted afterwards.
+    fn set_defer_par2_volumes(&self, _on: bool) {}
 
     /// Lifetime count of worker evictions performed by the heartbeat
     /// watchdog. Increases by 1 each time the supervisor reclaims a stalled
@@ -144,7 +165,23 @@ impl DispatchHandle {
         bandwidth: Arc<BandwidthLimiter>,
         article_timeout_secs: u64,
     ) -> Self {
-        let tracker = Arc::new(ConnectionTracker::new());
+        Self::with_budgets(
+            servers,
+            bandwidth,
+            article_timeout_secs,
+            Arc::new(BudgetRegistry::default()),
+        )
+    }
+
+    /// Like [`Self::new`], drawing connection permits from `budgets` so the
+    /// downloader shares each server's allowance with other consumers.
+    pub fn with_budgets(
+        servers: Arc<Mutex<Vec<ServerConfig>>>,
+        bandwidth: Arc<BandwidthLimiter>,
+        article_timeout_secs: u64,
+        budgets: Arc<BudgetRegistry>,
+    ) -> Self {
+        let tracker = Arc::new(ConnectionTracker::with_budgets(budgets));
         for server in servers.lock().iter() {
             tracker.set_limit(&server.id, &server.name, server.connections as usize);
         }
@@ -200,6 +237,10 @@ impl DispatchEngine for DispatchHandle {
         self.0.job_active_secs(job_id)
     }
 
+    fn held_par2_files(&self, job_id: &str) -> Option<Vec<String>> {
+        self.0.held_par2_files(job_id)
+    }
+
     fn release_completed_job(&self, job_id: &str) {
         self.0.release_completed_job(job_id);
     }
@@ -222,7 +263,7 @@ impl DispatchEngine for DispatchHandle {
     }
 
     fn connection_snapshot(&self) -> Vec<(String, usize, usize)> {
-        self.0.conn_tracker().snapshot()
+        self.0.conn_tracker().open_snapshot()
     }
 
     fn active_connection_snapshot(&self) -> Vec<(String, usize, usize)> {
@@ -239,6 +280,18 @@ impl DispatchEngine for DispatchHandle {
 
     fn set_max_worker_idle(&self, d: Duration) {
         self.0.set_max_worker_idle(d);
+    }
+
+    fn set_idle_keepalive(&self, d: Duration) {
+        self.0.set_idle_keepalive(d);
+    }
+
+    fn set_idle_release(&self, d: Duration) {
+        self.0.set_idle_release(d);
+    }
+
+    fn set_defer_par2_volumes(&self, on: bool) {
+        self.0.set_defer_par2_volumes(on);
     }
 
     fn eviction_count(&self) -> u64 {
